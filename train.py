@@ -17,11 +17,36 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from kernels import get_kernel
 cap = torch.cuda.get_device_capability()
-# varunneal's FA3 is Hopper only, use kernels-community on non-Hopper GPUs
-repo = "varunneal/flash-attention-3" if cap == (9, 0) else "kernels-community/flash-attn3"
-fa3 = get_kernel(repo).flash_attn_interface
+_use_fa3 = cap[0] <= 9  # FA3 kernels compiled up to Hopper SM9.x; Blackwell SM12.x not supported
+if _use_fa3:
+    from kernels import get_kernel
+    repo = "varunneal/flash-attention-3" if cap == (9, 0) else "kernels-community/flash-attn3"
+    _fa3 = get_kernel(repo).flash_attn_interface
+else:
+    print(f"GPU SM {cap[0]}.{cap[1]}: FA3 not available, using PyTorch SDPA fallback")
+
+
+def attention_fn(q, k, v, causal=True, window_size=None):
+    if _use_fa3:
+        return _fa3.flash_attn_func(q, k, v, causal=causal, window_size=window_size)
+    # PyTorch SDPA: (B, T, H, D) -> (B, H, T, D)
+    B, T, H_q, D = q.shape
+    H_kv = k.shape[2]
+    q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
+    if H_kv != H_q:
+        n_rep = H_q // H_kv
+        k = k.repeat_interleave(n_rep, dim=1)
+        v = v.repeat_interleave(n_rep, dim=1)
+    w = window_size[0] if window_size is not None else -1
+    if causal and 0 < w < T:
+        row = torch.arange(T, device=q.device).unsqueeze(1)
+        col = torch.arange(T, device=q.device).unsqueeze(0)
+        mask = (col <= row) & (col >= row - w + 1)
+        y = F.scaled_dot_product_attention(q, k, v, attn_mask=mask)
+    else:
+        y = F.scaled_dot_product_attention(q, k, v, is_causal=causal)
+    return y.transpose(1, 2)
 
 from prepare import MAX_SEQ_LEN, TIME_BUDGET, Tokenizer, make_dataloader, evaluate_bpb
 
@@ -90,7 +115,7 @@ class CausalSelfAttention(nn.Module):
         q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
         q, k = norm(q), norm(k)
 
-        y = fa3.flash_attn_func(q, k, v, causal=True, window_size=window_size)
+        y = attention_fn(q, k, v, causal=True, window_size=window_size)
         y = y.contiguous().view(B, T, -1)
         y = self.c_proj(y)
         return y
